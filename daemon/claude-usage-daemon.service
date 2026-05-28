@@ -1,11 +1,9 @@
 [Unit]
 Description=Claude Usage Tracker Daemon (BLE)
-Requires=bluetooth.target
-After=bluetooth.target
 
 [Service]
 Type=simple
-ExecStart=DAEMON_PATH
+ExecStart="__PYTHON_BIN__" "__DAEMON_PATH__"
 Restart=on-failure
 RestartSec=5
 

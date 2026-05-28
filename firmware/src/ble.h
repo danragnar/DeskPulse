@@ -18,6 +18,7 @@ bool ble_has_data(void);
 const char* ble_get_data(void);
 void ble_send_ack(void);
 void ble_send_nack(void);
+void ble_send_action(const char* action, const char* request_id);
 void ble_request_refresh(void);
 
 // BLE HID keyboard

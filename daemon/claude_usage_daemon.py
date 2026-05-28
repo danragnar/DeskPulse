@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Claude Usage Tracker Daemon (BLE) — macOS port of claude-usage-daemon.sh.
+"""Claude Usage Tracker Daemon (BLE) for Linux and macOS.
 
 Polls Claude API rate-limit headers and writes a JSON payload to the
 ESP32 "Claude Controller" peripheral over a custom GATT service. Uses
-bleak (CoreBluetooth backend on macOS).
+bleak on the active platform backend.
 """
 
 import asyncio
@@ -19,6 +19,7 @@ from pathlib import Path
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
+from codex_attention import clear_attention_state, read_attention_state, write_attention_decision
 from providers import Provider, Usage
 from providers.claude import ClaudeProvider
 from providers.codex import CodexProvider
@@ -26,6 +27,7 @@ from providers.codex import CodexProvider
 DEVICE_NAME = "Claude Controller"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
+TX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000003"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
@@ -73,7 +75,7 @@ async def scan_for_device() -> str | None:
 
 
 def usage_to_payload(usage: Usage) -> dict:
-    return {
+    payload = {
         "s": usage.session_pct,
         "sr": usage.session_reset_min,
         "w": usage.weekly_pct,
@@ -81,6 +83,29 @@ def usage_to_payload(usage: Usage) -> dict:
         "st": usage.status,
         "ok": usage.ok,
     }
+    if usage.attention_message:
+        payload["m"] = usage.attention_message
+    if usage.attention_request_id:
+        payload["r"] = usage.attention_request_id
+    return payload
+
+
+def apply_attention_state(provider: Provider, usage: Usage) -> Usage:
+    if provider.name != "codex" or not usage.ok:
+        return usage
+    attention = read_attention_state()
+    if attention is None:
+        return usage
+    return Usage(
+        usage.session_pct,
+        usage.session_reset_min,
+        usage.weekly_pct,
+        usage.weekly_reset_min,
+        attention.status,
+        usage.ok,
+        attention.message,
+        attention.request_id,
+    )
 
 
 def failed_usage(status: str) -> Usage:
@@ -100,6 +125,27 @@ def dual_provider_payload(usages: dict[str, Usage]) -> dict:
     for name, key in DUAL_PROVIDER_KEYS.items():
         payload[key] = usage_to_payload(usages.get(name, failed_usage(f"{name}_missing")))
     return payload
+
+
+def clear_delivered_transient_attention(payload: dict) -> None:
+    """Approval prompts are edge notifications; clear after one successful send."""
+    statuses: list[str] = []
+    top_status = payload.get("st")
+    if isinstance(top_status, str):
+        statuses.append(top_status)
+    if isinstance(payload.get("r"), str):
+        return
+
+    codex_payload = payload.get("x")
+    if isinstance(codex_payload, dict):
+        codex_status = codex_payload.get("st")
+        if isinstance(codex_status, str):
+            statuses.append(codex_status)
+        if isinstance(codex_payload.get("r"), str):
+            return
+
+    if "approval_needed" in statuses:
+        clear_attention_state({"hook_event_name": "DeskPulseDelivered"})
 
 
 def load_config_provider() -> str | None:
@@ -160,6 +206,7 @@ async def fetch_usage_payload(providers: list[Provider]) -> dict | None:
         usage = await providers[0].fetch_usage()
         if usage is None:
             return None
+        usage = apply_attention_state(providers[0], usage)
         return single_provider_payload(providers[0], usage)
 
     results = await asyncio.gather(
@@ -174,7 +221,7 @@ async def fetch_usage_payload(providers: list[Provider]) -> dict | None:
         elif result is None:
             by_name[provider.name] = failed_usage(f"{provider.name}_error")
         else:
-            by_name[provider.name] = result
+            by_name[provider.name] = apply_attention_state(provider, result)
 
     return dual_provider_payload(by_name)
 
@@ -183,10 +230,24 @@ class Session:
     def __init__(self, client: BleakClient) -> None:
         self.client = client
         self.refresh_requested = asyncio.Event()
+        self.attention_key: tuple[str, int] | None = None
 
     def _on_refresh(self, _char, _data: bytearray) -> None:
         log("Refresh requested by device")
         self.refresh_requested.set()
+
+    def _on_device_message(self, _char, data: bytearray) -> None:
+        try:
+            message = json.loads(data.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(message, dict):
+            return
+        action = message.get("action")
+        request_id = message.get("request_id")
+        if action in {"allow", "deny"} and isinstance(request_id, str):
+            if write_attention_decision(request_id, action):
+                log(f"Permission {action} received from device")
 
     async def setup_refresh_subscription(self) -> None:
         try:
@@ -194,13 +255,44 @@ class Session:
         except (BleakError, ValueError) as e:
             log(f"Refresh subscription unavailable: {e}")
 
+    async def setup_device_message_subscription(self) -> None:
+        try:
+            await self.client.start_notify(TX_CHAR_UUID, self._on_device_message)
+        except (BleakError, ValueError) as e:
+            log(f"Device message subscription unavailable: {e}")
+
+    def attention_changed(self) -> bool:
+        attention = read_attention_state()
+        if attention is None:
+            key = None
+        else:
+            key = (attention.request_id or attention.status, attention.updated_at)
+        changed = key != self.attention_key
+        if not changed:
+            return False
+        self.attention_key = key
+        return True
+
     async def write_payload(self, payload: dict) -> bool:
         data = json.dumps(payload, separators=(",", ":")).encode()
-        log(f"Sending: {data.decode()}")
+        log(f"Sending ({len(data)} bytes): {data.decode()}")
         try:
-            await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
+            char = self.client.services.get_characteristic(RX_CHAR_UUID)
+            max_write_without_response = (
+                char.max_write_without_response_size if char is not None else 20
+            )
+            response = len(data) > max_write_without_response
+            await self.client.write_gatt_char(RX_CHAR_UUID, data, response=response)
             return True
         except BleakError as e:
+            if len(data) <= 512:
+                try:
+                    log(f"Write without response failed, retrying with response: {e}")
+                    await self.client.write_gatt_char(RX_CHAR_UUID, data, response=True)
+                    return True
+                except BleakError as retry_error:
+                    log(f"Write failed: {retry_error}")
+                    return False
             log(f"Write failed: {e}")
             return False
 
@@ -231,6 +323,7 @@ async def connect_and_run(
     log("Connected")
     session = Session(client)
     await session.setup_refresh_subscription()
+    await session.setup_device_message_subscription()
 
     last_poll = 0.0
     used_successfully = False
@@ -238,10 +331,11 @@ async def connect_and_run(
         while client.is_connected and not stop_event.is_set():
             now = time.time()
             elapsed = now - last_poll
-            if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
+            if session.refresh_requested.is_set() or session.attention_changed() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
                 payload = await fetch_usage_payload(providers)
                 if payload is not None and await session.write_payload(payload):
+                    clear_delivered_transient_attention(payload)
                     last_poll = time.time()
                     used_successfully = True
 
@@ -277,7 +371,7 @@ async def main(argv: list[str] | None = None) -> None:
     provider_name, provider_source = resolve_provider_name(args)
     providers = build_providers(provider_name)
 
-    log("=== Clawdmeter Usage Tracker Daemon (BLE, macOS) ===")
+    log("=== Clawdmeter Usage Tracker Daemon (BLE, Linux/macOS) ===")
     log(f"Provider: {provider_name} ({provider_source})")
     log(f"Poll interval: {POLL_INTERVAL}s")
 

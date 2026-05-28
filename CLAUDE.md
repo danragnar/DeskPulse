@@ -13,7 +13,8 @@ Two reference ports today:
 
 The shared code calls a small HAL (`firmware/src/hal/`) that each board implements: display, touch, input, power, IMU. Optional features are guarded by `BoardCaps` (runtime) and `BOARD_HAS_*` (compile-time) rather than `#ifdef BOARD_*`.
 
-Connects to a host daemon over BLE; daemon polls Anthropic API for usage data. This file is for future Claude Code sessions to bootstrap quickly. Read this first.
+Connects to a host daemon over BLE; daemon polls Claude or Codex usage data.
+This file is for future Claude Code sessions to bootstrap quickly. Read this first.
 
 ## Hardware (critical pins)
 
@@ -131,7 +132,21 @@ See `~/.claude/projects/.../memory/` files for persistent context (user is an em
 
 ## Daemon / host side
 
-Bash daemon (`daemon/claude-usage-daemon.sh`) reads OAuth token, polls Anthropic API, sends JSON over BLE GATT. Run with `systemctl --user start claude-usage-daemon`. The unit file's `ExecStart` is the absolute path to the script — repoint it when switching between the worktree and the main checkout.
+Python daemon (`daemon/claude_usage_daemon.py`) reads Claude or Codex auth,
+polls the relevant usage API, and sends JSON over BLE GATT. On macOS it runs
+from launchd; on Linux it runs as a systemd user service. The Linux installer
+renders `daemon/claude-usage-daemon.service` with the local venv Python path
+and daemon path.
+
+Codex attention alerts use Codex lifecycle hooks. `install-codex-hook.sh` adds
+user-level `~/.codex/hooks.json` entries for `SessionStart`,
+`PermissionRequest`, `UserPromptSubmit`, and `Stop`. The hook writes
+`~/.config/claude-usage-monitor/codex-attention.json`; the daemon overlays the
+Codex status with `approval_needed` or `needs_input` when the usage fetch is
+otherwise healthy. For `PermissionRequest`, the hook waits up to two minutes
+for a device `Allow`/`Deny` action relayed through the daemon before falling
+back to Codex's normal approval prompt. `needs_input` alerts are notification
+only.
 
 **Discovery & resilience:**
 

@@ -126,6 +126,11 @@ static void compute_layout(const BoardCaps& c) {
 static lv_obj_t* usage_dual_container;
 static lv_obj_t* usage_claude_container;
 static lv_obj_t* usage_codex_container;
+static lv_obj_t* attention_banner;
+static lv_obj_t* attention_modal;
+static lv_obj_t* attention_modal_title;
+static lv_obj_t* attention_modal_body;
+static lv_obj_t* attention_modal_actions;
 static lv_obj_t* lbl_anim;
 
 struct ProviderUsageWidgets {
@@ -146,6 +151,7 @@ static ProviderUsageWidgets dual_widgets[USAGE_PROVIDER_COUNT];
 
 struct SingleProviderUsageWidgets {
     lv_obj_t* root;
+    lv_obj_t* status;
     lv_obj_t* session_pct;
     lv_obj_t* session_bar;
     lv_obj_t* session_reset;
@@ -171,6 +177,10 @@ static lv_image_dsc_t logo_dsc;
 static lv_image_dsc_t codex_icon_dsc;
 static lv_image_dsc_t bluetooth_icon_dsc;
 static screen_t current_screen = SCREEN_USAGE;
+static bool attention_active = false;
+static char attention_text[24] = "";
+static char attention_detail[161] = "";
+static char attention_request_id[17] = "";
 
 // Animation state
 static uint32_t anim_last_ms = 0;
@@ -232,6 +242,25 @@ static lv_color_t pct_color(float pct) {
     return COL_GREEN;
 }
 
+static bool is_attention_status(const char* status) {
+    return status &&
+           (strcmp(status, "approval_needed") == 0 ||
+            strcmp(status, "needs_input") == 0);
+}
+
+static const char* display_status(const ProviderUsageData* usage) {
+    if (!usage->ok) return "error";
+    if (strcmp(usage->status, "approval_needed") == 0) return "approval";
+    if (strcmp(usage->status, "needs_input") == 0) return "needs input";
+    return usage->status;
+}
+
+static lv_color_t status_color(const ProviderUsageData* usage) {
+    if (!usage->ok) return COL_RED;
+    if (is_attention_status(usage->status)) return COL_AMBER;
+    return COL_GREEN;
+}
+
 static void format_reset_short(int mins, char* buf, size_t len) {
     if (mins < 0) {
         snprintf(buf, len, "--");
@@ -279,6 +308,10 @@ static int provider_icon_source_w(UsageProvider provider) {
 // Forward decls — callbacks defined near ui_show_screen below
 static void global_click_cb(lv_event_t* e);
 static void ble_reset_click_cb(lv_event_t* e);
+static void attention_click_cb(lv_event_t* e);
+static void attention_modal_click_cb(lv_event_t* e);
+static void attention_action_click_cb(lv_event_t* e);
+static void show_attention_modal(void);
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -368,6 +401,101 @@ static lv_obj_t* make_pill(lv_obj_t* parent, const char* text) {
     return lbl;
 }
 
+static lv_obj_t* make_attention_banner(lv_obj_t* parent) {
+    lv_obj_t* banner = lv_label_create(parent);
+    lv_label_set_text(banner, "");
+    lv_obj_set_style_text_font(banner, L.usage_reset_font, 0);
+    lv_obj_set_style_text_color(banner, COL_BG, 0);
+    lv_obj_set_style_bg_color(banner, COL_AMBER, 0);
+    lv_obj_set_style_bg_opa(banner, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(banner, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_left(banner, 14, 0);
+    lv_obj_set_style_pad_right(banner, 14, 0);
+    lv_obj_set_style_pad_top(banner, 6, 0);
+    lv_obj_set_style_pad_bottom(banner, 6, 0);
+    lv_obj_align(banner, LV_ALIGN_BOTTOM_MID, 0, -14);
+    lv_obj_add_flag(banner, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(banner, 32);
+    lv_obj_add_event_cb(banner, attention_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(banner, LV_OBJ_FLAG_HIDDEN);
+    return banner;
+}
+
+static lv_obj_t* make_attention_action(lv_obj_t* parent, const char* text, lv_color_t bg,
+                                       lv_color_t fg, const char* action) {
+    lv_obj_t* btn = lv_obj_create(parent);
+    lv_obj_set_size(btn, (L.content_w - 44) / 2, L.scr_h >= 460 ? 58 : 48);
+    lv_obj_set_style_bg_color(btn, bg, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(btn, attention_action_click_cb, LV_EVENT_CLICKED, (void*)action);
+
+    lv_obj_t* lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, L.usage_name_font, 0);
+    lv_obj_set_style_text_color(lbl, fg, 0);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+static void init_attention_modal(lv_obj_t* scr) {
+    attention_modal = lv_obj_create(scr);
+    lv_obj_set_size(attention_modal, L.scr_w, L.scr_h);
+    lv_obj_set_pos(attention_modal, 0, 0);
+    lv_obj_set_style_bg_color(attention_modal, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(attention_modal, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(attention_modal, 0, 0);
+    lv_obj_set_style_pad_all(attention_modal, 0, 0);
+    lv_obj_clear_flag(attention_modal, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(attention_modal, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(attention_modal, attention_modal_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* card = make_panel(attention_modal, L.margin, L.content_y,
+                                L.content_w, L.scr_h - L.content_y - 54);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_event_cb(card, attention_modal_click_cb, LV_EVENT_CLICKED, NULL);
+
+    attention_modal_title = lv_label_create(card);
+    lv_label_set_text(attention_modal_title, "Codex approval");
+    lv_obj_set_style_text_font(attention_modal_title, L.usage_name_font, 0);
+    lv_obj_set_style_text_color(attention_modal_title, COL_AMBER, 0);
+    lv_obj_set_pos(attention_modal_title, 0, 0);
+
+    attention_modal_body = lv_label_create(card);
+    lv_label_set_text(attention_modal_body, "No permission detail available.");
+    lv_obj_set_style_text_font(attention_modal_body, L.usage_reset_font, 0);
+    lv_obj_set_style_text_color(attention_modal_body, COL_TEXT, 0);
+    lv_label_set_long_mode(attention_modal_body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(attention_modal_body, L.content_w - 32);
+    lv_obj_set_pos(attention_modal_body, 0, L.scr_h >= 460 ? 46 : 38);
+
+    attention_modal_actions = lv_obj_create(card);
+    lv_obj_set_size(attention_modal_actions, L.content_w - 32, L.scr_h >= 460 ? 64 : 54);
+    lv_obj_align(attention_modal_actions, LV_ALIGN_BOTTOM_MID, 0, -32);
+    lv_obj_set_style_bg_opa(attention_modal_actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(attention_modal_actions, 0, 0);
+    lv_obj_set_style_pad_all(attention_modal_actions, 0, 0);
+    lv_obj_set_style_pad_column(attention_modal_actions, 12, 0);
+    lv_obj_set_flex_flow(attention_modal_actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(attention_modal_actions, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(attention_modal_actions, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(attention_modal_actions, LV_OBJ_FLAG_EVENT_BUBBLE);
+    make_attention_action(attention_modal_actions, "Deny", COL_RED, COL_TEXT, "deny");
+    make_attention_action(attention_modal_actions, "Allow", COL_AMBER, COL_BG, "allow");
+
+    lv_obj_t* hint = lv_label_create(card);
+    lv_label_set_text(hint, "Tap to close");
+    lv_obj_set_style_text_font(hint, L.usage_reset_font, 0);
+    lv_obj_set_style_text_color(hint, COL_DIM, 0);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    lv_obj_add_flag(attention_modal, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void make_provider_mark(lv_obj_t* panel, ProviderUsageWidgets* widgets,
                                UsageProvider provider) {
     lv_obj_t* mark = lv_obj_create(panel);
@@ -405,6 +533,11 @@ static void make_provider_usage_panel(lv_obj_t* parent, ProviderUsageWidgets* wi
     lv_obj_set_style_text_font(widgets->status, L.usage_reset_font, 0);
     lv_obj_set_style_text_color(widgets->status, COL_DIM, 0);
     lv_obj_align(widgets->status, LV_ALIGN_TOP_RIGHT, 0, 8);
+    if (provider == USAGE_PROVIDER_CODEX) {
+        lv_obj_add_flag(widgets->status, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_ext_click_area(widgets->status, 32);
+        lv_obj_add_event_cb(widgets->status, attention_click_cb, LV_EVENT_CLICKED, NULL);
+    }
 
     const int gap = 14;
     const int col_w = (inner_w - gap) / 2;
@@ -524,6 +657,7 @@ static void init_usage_screen(lv_obj_t* scr) {
 
     usage_codex_container = make_usage_root(scr, "Codex");
     single_widgets[USAGE_PROVIDER_CODEX].root = usage_codex_container;
+    single_widgets[USAGE_PROVIDER_CODEX].status = make_attention_banner(usage_codex_container);
     make_single_metric_panel(usage_codex_container, L.content_y, "5h",
                              &single_widgets[USAGE_PROVIDER_CODEX].session_pct,
                              &single_widgets[USAGE_PROVIDER_CODEX].session_bar,
@@ -535,6 +669,8 @@ static void init_usage_screen(lv_obj_t* scr) {
                              &single_widgets[USAGE_PROVIDER_CODEX].weekly_bar,
                              &single_widgets[USAGE_PROVIDER_CODEX].weekly_reset);
     lv_obj_add_flag(usage_codex_container, LV_OBJ_FLAG_HIDDEN);
+
+    attention_banner = make_attention_banner(scr);
 }
 
 // ======== Bluetooth Screen ========
@@ -629,6 +765,7 @@ void ui_init(void) {
     init_usage_screen(scr);
     init_bluetooth_screen(scr);
     splash_init(scr);
+    init_attention_modal(scr);
 
     if (splash_get_root()) {
         lv_obj_add_event_cb(splash_get_root(), global_click_cb, LV_EVENT_CLICKED, NULL);
@@ -661,6 +798,7 @@ static void clear_dual_provider_widgets(ProviderUsageWidgets* widgets) {
 
 static void clear_single_provider_widgets(SingleProviderUsageWidgets* widgets) {
     if (!widgets->root) return;
+    if (widgets->status) lv_obj_add_flag(widgets->status, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(widgets->session_pct, "--%");
     lv_label_set_text(widgets->weekly_pct, "--%");
     lv_label_set_text(widgets->session_reset, "--");
@@ -680,8 +818,8 @@ static void update_dual_provider_widgets(ProviderUsageWidgets* widgets,
     set_usage_bar(widgets->weekly_bar, weekly_pct, pct_color(usage->weekly_pct));
     lv_label_set_text(widgets->session_reset, session_reset);
     lv_label_set_text(widgets->weekly_reset, weekly_reset);
-    lv_label_set_text(widgets->status, usage->ok ? usage->status : "error");
-    lv_obj_set_style_text_color(widgets->status, usage->ok ? COL_GREEN : COL_RED, 0);
+    lv_label_set_text(widgets->status, display_status(usage));
+    lv_obj_set_style_text_color(widgets->status, status_color(usage), 0);
 }
 
 static void update_single_provider_widgets(SingleProviderUsageWidgets* widgets,
@@ -696,6 +834,17 @@ static void update_single_provider_widgets(SingleProviderUsageWidgets* widgets,
     set_usage_bar(widgets->weekly_bar, weekly_pct, pct_color(usage->weekly_pct));
     lv_label_set_text(widgets->session_reset, session_reset);
     lv_label_set_text(widgets->weekly_reset, weekly_reset);
+    if (widgets->status) {
+        if (is_attention_status(usage->status)) {
+            lv_label_set_text(widgets->status,
+                              strcmp(usage->status, "approval_needed") == 0
+                                  ? "Codex approval"
+                                  : "Codex needs input");
+            lv_obj_clear_flag(widgets->status, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(widgets->status, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
 static void update_provider_usage_widgets(ProviderUsageWidgets* dual,
@@ -726,6 +875,31 @@ void ui_update(const UsageData* data) {
     for (int i = 0; i < USAGE_PROVIDER_COUNT; i++) {
         update_provider_usage_widgets(&dual_widgets[i], &single_widgets[i],
                                       &data->providers[i]);
+    }
+
+    const ProviderUsageData* codex = &data->providers[USAGE_PROVIDER_CODEX];
+    attention_active = codex->valid && is_attention_status(codex->status);
+    if (attention_active) {
+        snprintf(attention_text, sizeof(attention_text), "%s",
+                 strcmp(codex->status, "approval_needed") == 0
+                     ? "Codex approval"
+                     : "Codex needs input");
+        snprintf(attention_detail, sizeof(attention_detail), "%s", codex->message);
+        snprintf(attention_request_id, sizeof(attention_request_id), "%s", codex->request_id);
+    } else {
+        attention_text[0] = '\0';
+        attention_detail[0] = '\0';
+        attention_request_id[0] = '\0';
+        if (attention_modal) lv_obj_add_flag(attention_modal, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (attention_banner && attention_active) {
+        lv_label_set_text(attention_banner, attention_text);
+        if (current_screen != SCREEN_SPLASH && current_screen != SCREEN_USAGE_CODEX) {
+            lv_obj_clear_flag(attention_banner, LV_OBJ_FLAG_HIDDEN);
+        }
+    } else if (attention_banner) {
+        lv_obj_add_flag(attention_banner, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -760,8 +934,28 @@ static void apply_battery_visibility(void) {
     else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
 }
 
+static void apply_attention_visibility(void) {
+    if (!attention_banner) return;
+    if (!attention_active || current_screen == SCREEN_SPLASH || current_screen == SCREEN_USAGE_CODEX) {
+        lv_obj_add_flag(attention_banner, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_label_set_text(attention_banner, attention_text);
+        lv_obj_clear_flag(attention_banner, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void global_click_cb(lv_event_t* e) {
-    (void)e;
+    if (lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+
+    if (attention_active && current_screen != SCREEN_SPLASH) {
+        lv_point_t point;
+        lv_indev_get_point(lv_indev_active(), &point);
+        if (point.y >= L.scr_h - 96) {
+            show_attention_modal();
+            return;
+        }
+    }
+
     if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
     else                                  ui_show_screen(SCREEN_SPLASH);
 }
@@ -769,6 +963,42 @@ static void global_click_cb(lv_event_t* e) {
 static void ble_reset_click_cb(lv_event_t* e) {
     (void)e;
     ble_clear_bonds();
+}
+
+static void attention_click_cb(lv_event_t* e) {
+    lv_event_stop_bubbling(e);
+    show_attention_modal();
+}
+
+static void attention_modal_click_cb(lv_event_t* e) {
+    lv_event_stop_bubbling(e);
+    if (attention_modal) lv_obj_add_flag(attention_modal, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void attention_action_click_cb(lv_event_t* e) {
+    lv_event_stop_bubbling(e);
+    const char* action = (const char*)lv_event_get_user_data(e);
+    if (!attention_active || !attention_request_id[0] || !action) return;
+    ble_send_action(action, attention_request_id);
+    if (attention_modal) lv_obj_add_flag(attention_modal, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void show_attention_modal(void) {
+    if (!attention_active || !attention_modal) return;
+
+    lv_label_set_text(attention_modal_title, attention_text);
+    lv_label_set_text(attention_modal_body,
+                      attention_detail[0] ? attention_detail
+                                          : "No permission detail available.");
+    if (attention_modal_actions) {
+        if (attention_request_id[0] && strcmp(attention_text, "Codex approval") == 0) {
+            lv_obj_clear_flag(attention_modal_actions, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(attention_modal_actions, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    lv_obj_move_foreground(attention_modal);
+    lv_obj_clear_flag(attention_modal, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void hide_screen_roots(void) {
@@ -798,6 +1028,7 @@ void ui_show_screen(screen_t screen) {
     if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
     current_screen = screen;
     apply_battery_visibility();
+    apply_attention_visibility();
 }
 
 void ui_cycle_screen(void) {

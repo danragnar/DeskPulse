@@ -27,9 +27,10 @@ Board env names:
 
 - PlatformIO CLI
 - macOS: `python3`
-- Linux: `curl`, `bluetoothctl`, `busctl`
+- Linux: `python3` with `venv` support and a systemd user session
 - Claude Code login for Claude usage
 - Codex / ChatGPT login for Codex usage
+- Codex hooks enabled for Codex approval/input alerts
 
 If `pio` is not on your PATH, try `~/.platformio/penv/bin/pio`.
 
@@ -78,6 +79,19 @@ On first run, allow the macOS Bluetooth permission prompt.
 
 The provider setting is stored in `daemon/config.toml`.
 
+### 5. Optional: enable Codex input alerts
+
+```bash
+./install-codex-hook.sh
+```
+
+Then open `/hooks` in Codex and trust the DeskPulse hook if Codex marks it for
+review. When Codex asks for permission, the device shows an amber Codex alert;
+tap it to view the request and choose `Allow` or `Deny`. If no device decision
+arrives within two minutes, Codex falls back to its normal approval prompt.
+When Codex stops with a likely user question, the device shows a read-only
+amber input alert.
+
 Provider priority:
 
 1. CLI flag: `daemon/.venv/bin/python daemon/claude_usage_daemon.py --provider both`
@@ -85,7 +99,7 @@ Provider priority:
 3. Config file: `daemon/config.toml`
 4. Built-in fallback: `claude`
 
-### 5. Check logs
+### 6. Check logs
 
 ```bash
 tail -F ~/Library/Logs/claude-usage-daemon.out.log
@@ -109,7 +123,8 @@ launchctl load -w ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist
 
 ## Linux Setup
 
-The Linux installer currently uses the legacy Claude-only shell daemon.
+The Linux installer uses the Python daemon, which supports Claude, Codex, or
+both providers.
 
 ### 1. Flash firmware
 
@@ -119,6 +134,8 @@ The Linux installer currently uses the legacy Claude-only shell daemon.
 ```
 
 ### 2. Pair Bluetooth
+
+This step uses `bluetoothctl`.
 
 ```bash
 bluetoothctl scan le
@@ -135,6 +152,30 @@ Bluetooth screen.
 ./install.sh
 systemctl --user start claude-usage-daemon
 ```
+
+### 4. Choose provider
+
+```bash
+./switch-provider.sh both
+./switch-provider.sh claude
+./switch-provider.sh codex
+```
+
+The provider setting is stored in `daemon/config.toml`, and the switch script
+restarts the Linux user service after updating it.
+
+### 5. Optional: enable Codex input alerts
+
+```bash
+./install-codex-hook.sh
+```
+
+Then open `/hooks` in Codex and trust the DeskPulse hook if Codex marks it for
+review. When Codex asks for permission, the device shows an amber Codex alert;
+tap it to view the request and choose `Allow` or `Deny`. If no device decision
+arrives within two minutes, Codex falls back to its normal approval prompt.
+When Codex stops with a likely user question, the device shows a read-only
+amber input alert.
 
 Useful service commands:
 

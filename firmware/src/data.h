@@ -13,6 +13,8 @@ struct ProviderUsageData {
     float weekly_pct;        // 7-day window utilization (0-100)
     int weekly_reset_mins;   // minutes until weekly resets
     char status[24];         // "allowed", "limited", or provider-specific error
+    char message[161];       // optional Codex attention detail
+    char request_id[17];      // optional Codex permission request id
     bool ok;                 // data parse succeeded
     bool valid;              // false until this provider has data
 };

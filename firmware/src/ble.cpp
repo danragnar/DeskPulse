@@ -259,6 +259,15 @@ void ble_send_nack(void) {
     }
 }
 
+void ble_send_action(const char* action, const char* request_id) {
+    if (state != BLE_STATE_CONNECTED || !tx_char || !action || !request_id || !request_id[0]) return;
+    char msg[96];
+    snprintf(msg, sizeof(msg), "{\"action\":\"%s\",\"request_id\":\"%s\"}", action, request_id);
+    tx_char->setValue(msg);
+    tx_char->notify();
+    Serial.printf("BLE: action sent %s %s\n", action, request_id);
+}
+
 void ble_request_refresh(void) {
     if (state == BLE_STATE_CONNECTED && req_char) {
         uint8_t v = 0x01;

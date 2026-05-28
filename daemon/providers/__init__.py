@@ -20,6 +20,8 @@ class Usage:
     weekly_reset_min: int
     status: str
     ok: bool
+    attention_message: str = ""
+    attention_request_id: str = ""
 
 
 class Provider(Protocol):

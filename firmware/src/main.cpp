@@ -101,6 +101,8 @@ static void reset_provider_usage(ProviderUsageData* out) {
     out->weekly_pct = 0.0f;
     out->weekly_reset_mins = -1;
     strlcpy(out->status, "waiting", sizeof(out->status));
+    out->message[0] = '\0';
+    out->request_id[0] = '\0';
     out->ok = false;
     out->valid = false;
 }
@@ -127,6 +129,8 @@ static bool parse_provider_usage(JsonVariantConst src, ProviderUsageData* out) {
     out->weekly_pct = src["w"] | 0.0f;
     out->weekly_reset_mins = src["wr"] | -1;
     strlcpy(out->status, src["st"] | "unknown", sizeof(out->status));
+    strlcpy(out->message, src["m"] | "", sizeof(out->message));
+    strlcpy(out->request_id, src["r"] | "", sizeof(out->request_id));
     out->ok = src["ok"] | false;
     out->valid = true;
     return true;
